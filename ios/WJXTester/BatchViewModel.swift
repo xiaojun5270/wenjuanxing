@@ -561,6 +561,9 @@ final class BatchViewModel: ObservableObject {
                 answers: entry.answers,
                 optionalTopics: [entry.emailTopic],
                 releaseDate: releaseDate,
+                onProgress: { [weak self] message in
+                    self?.appendLog(.info, "\(entry.logLabel)：\(message)")
+                },
                 gate: gate
             )
             if Task.isCancelled {

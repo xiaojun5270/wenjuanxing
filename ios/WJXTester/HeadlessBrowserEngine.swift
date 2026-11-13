@@ -82,6 +82,7 @@ final class HeadlessBrowserEngine {
         answers: [Int: String],
         optionalTopics: Set<Int>,
         releaseDate: Date?,
+        onProgress: @escaping @MainActor (String) -> Void,
         gate: BrowserSubmissionGate
     ) async -> SubmissionOutcome {
         await withTaskCancellationHandler(operation: {
@@ -91,6 +92,7 @@ final class HeadlessBrowserEngine {
                     answers: answers,
                     optionalTopics: optionalTopics,
                     releaseDate: releaseDate,
+                    onProgress: onProgress,
                     gate: gate
                 ) { [weak self] outcome in
                     self?.workers.removeValue(forKey: id)
@@ -121,6 +123,7 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
     private let answers: [Int: String]
     private let optionalTopics: Set<Int>
     private let releaseDate: Date?
+    private let onProgress: @MainActor (String) -> Void
     private let gate: BrowserSubmissionGate
     private var completion: ((SubmissionOutcome) -> Void)?
     private var webView: WKWebView!
@@ -128,6 +131,7 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
     private var didSubmit = false
     private var didJoinGate = false
     private var isFinished = false
+    private var countdownTask: Task<Void, Never>?
     private var submitTask: Task<Void, Never>?
     private var probeTask: Task<Void, Never>?
     private var timeoutTask: Task<Void, Never>?
@@ -137,6 +141,7 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
         answers: [Int: String],
         optionalTopics: Set<Int>,
         releaseDate: Date?,
+        onProgress: @escaping @MainActor (String) -> Void,
         gate: BrowserSubmissionGate,
         completion: @escaping (SubmissionOutcome) -> Void
     ) {
@@ -144,6 +149,7 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
         self.answers = answers
         self.optionalTopics = optionalTopics
         self.releaseDate = releaseDate
+        self.onProgress = onProgress
         self.gate = gate
         self.completion = completion
         super.init()
@@ -168,13 +174,7 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
 
     func start() {
         let secondsUntilDeadline = max(90, (releaseDate?.timeIntervalSinceNow ?? 0) + 90)
-        timeoutTask = Task { [weak self] in
-            try? await Task.sleep(
-                nanoseconds: UInt64(secondsUntilDeadline * 1_000_000_000)
-            )
-            guard !Task.isCancelled else { return }
-            self?.finish(.failure("隐藏浏览器等待结果超时"))
-        }
+        armTimeout(after: secondsUntilDeadline)
         webView.load(URLRequest(url: surveyURL))
     }
 
@@ -184,6 +184,8 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard !isFinished else { return }
+        countdownTask?.cancel()
+        countdownTask = nil
         if let outcome = successOutcome(from: webView.url) {
             finish(outcome)
             return
@@ -246,6 +248,11 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
         let optionalTopicsJSON = javascriptArray(optionalTopics)
         let fillScript = """
         (() => {
+          const opening = document.getElementById('divstarttime');
+          if (opening) {
+            const seconds = Math.max(1, Number(opening.getAttribute('left')) || 1);
+            return `countdown:${seconds}`;
+          }
           const answers = \(answersJSON);
           const optionalTopics = new Set(\(optionalTopicsJSON));
           const missing = [];
@@ -269,6 +276,14 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
             guard let self, !self.isFinished else { return }
             if let error {
                 self.finish(.failure("填写问卷失败：\(error.localizedDescription)"))
+                return
+            }
+            if let result = result as? String, result.hasPrefix("countdown:") {
+                let secondsText = result.replacingOccurrences(of: "countdown:", with: "")
+                let seconds = max(1, Int(secondsText) ?? 1)
+                self.didPrepareForm = false
+                self.onProgress("问卷尚未开放，剩余约 \(seconds) 秒")
+                self.scheduleCountdownReload(after: seconds)
                 return
             }
             if let result = result as? String, result.hasPrefix("missing:") {
@@ -337,6 +352,30 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
                 }
                 await self.probePageState()
             }
+        }
+    }
+
+    private func scheduleCountdownReload(after seconds: Int) {
+        countdownTask?.cancel()
+        let retrySeconds = min(max(1, seconds + 1), 60)
+        armTimeout(after: max(90, Double(seconds) + 120))
+        countdownTask = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(retrySeconds) * 1_000_000_000
+            )
+            guard !Task.isCancelled, let self, !self.isFinished else { return }
+            self.webView.reload()
+        }
+    }
+
+    private func armTimeout(after seconds: Double) {
+        timeoutTask?.cancel()
+        timeoutTask = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(max(1, seconds) * 1_000_000_000)
+            )
+            guard !Task.isCancelled else { return }
+            self?.finish(.failure("隐藏浏览器等待结果超时"))
         }
     }
 
@@ -453,6 +492,7 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
     private func finish(_ outcome: SubmissionOutcome) {
         guard !isFinished else { return }
         isFinished = true
+        countdownTask?.cancel()
         submitTask?.cancel()
         probeTask?.cancel()
         timeoutTask?.cancel()
