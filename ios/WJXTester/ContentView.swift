@@ -1,6 +1,23 @@
 import SwiftUI
 
 struct ContentView: View {
+    var body: some View {
+        TabView {
+            SingleSubmissionView()
+                .tabItem {
+                    Label("单条", systemImage: "person.fill")
+                }
+
+            BatchSubmissionView()
+                .tabItem {
+                    Label("批量", systemImage: "person.3.fill")
+                }
+        }
+        .tint(.green)
+    }
+}
+
+private struct SingleSubmissionView: View {
     @StateObject private var model = SurveyViewModel()
     @FocusState private var focusedField: Field?
 
@@ -47,7 +64,7 @@ struct ContentView: View {
                 }
 
                 Section("提交设置") {
-                    Stepper("等待时间：\(model.dwellSeconds) 秒", value: $model.dwellSeconds, in: 5...15)
+                    Stepper("等待时间：\(model.dwellSeconds) 秒", value: $model.dwellSeconds, in: 1...15)
                     Toggle("我已获授权测试此问卷", isOn: $model.isAuthorized)
                 }
 
@@ -86,7 +103,6 @@ struct ContentView: View {
                 statusSection
             }
             .navigationTitle("问卷测试")
-            .tint(.green)
             .alert("确认提交", isPresented: $model.showsConfirmation) {
                 Button("取消", role: .cancel) {}
                 Button("确认提交") {

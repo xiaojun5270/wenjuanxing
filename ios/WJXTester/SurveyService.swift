@@ -27,9 +27,7 @@ actor SurveyService {
     static let surveyID = "tghWxdt"
     static let pageURL = URL(string: "https://v.wjx.cn/vm/\(surveyID).aspx")!
 
-    private let session: URLSession
-
-    init() {
+    private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieAcceptPolicy = .always
         configuration.httpShouldSetCookies = true
@@ -38,10 +36,11 @@ actor SurveyService {
             "Accept-Language": "zh-CN,zh;q=0.9",
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"
         ]
-        session = URLSession(configuration: configuration)
+        return URLSession(configuration: configuration)
     }
 
     func submit(employeeID: String, name: String, dwellSeconds: Int) async throws -> SubmissionOutcome {
+        let session = makeSession()
         let startedAt = Date()
         let (pageData, pageResponse) = try await session.data(from: Self.pageURL)
         guard let httpResponse = pageResponse as? HTTPURLResponse,
