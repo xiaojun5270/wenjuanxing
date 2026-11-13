@@ -7,16 +7,51 @@ struct BatchSubmissionView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("问卷") {
+                    TextField("https://v.wjx.cn/vm/xxxx.aspx", text: $model.surveyURLString)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .disabled(model.isRunning)
+                    LabeledContent("状态") {
+                        if model.surveyURL != nil {
+                            Label("地址有效", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } else {
+                            Label("地址无效", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+
                 Section {
+                    Picker("名单模式", selection: $model.rosterMode) {
+                        ForEach(RosterMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(model.isRunning)
+
+                    Stepper(
+                        "\(model.rosterMode.rawValue)题号：\(model.topicNumber)",
+                        value: $model.topicNumber,
+                        in: 1...200
+                    )
+                    .disabled(model.isRunning)
+
                     ZStack(alignment: .topLeading) {
                         if model.rawList.isEmpty {
-                            Text("123456,张三\n李四")
+                            Text(model.rosterMode.placeholder)
                                 .foregroundStyle(.tertiary)
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 8)
                         }
                         TextEditor(text: $model.rawList)
                             .frame(minHeight: 150)
+                            .keyboardType(model.rosterMode.keyboardType)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
                             .focused($isEditorFocused)
                             .disabled(model.isRunning)
                     }
@@ -41,10 +76,27 @@ struct BatchSubmissionView: View {
                 } header: {
                     Text("名单")
                 } footer: {
-                    Text("每行填写“6位工号,姓名”；仅填写姓名时自动生成工号。")
+                    Text("每行填写一个\(model.rosterMode.rawValue)，最多 500 条。")
                 }
 
                 Section("执行设置") {
+                    Picker("开始方式", selection: $model.startMode) {
+                        ForEach(BatchStartMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(model.isRunning)
+
+                    if model.startMode == .scheduled {
+                        DatePicker(
+                            "提交时间",
+                            selection: $model.scheduledDate,
+                            displayedComponents: [.date, .hourAndMinute]
+                        )
+                        .disabled(model.isRunning)
+                    }
+
                     Stepper("等待时间：\(model.dwellSeconds) 秒", value: $model.dwellSeconds, in: 1...15)
                         .disabled(model.isRunning)
                     Stepper("并发数量：\(model.concurrency)", value: $model.concurrency, in: 1...10)
@@ -58,7 +110,10 @@ struct BatchSubmissionView: View {
                         Button(role: .destructive) {
                             model.cancel()
                         } label: {
-                            Label("停止任务", systemImage: "stop.fill")
+                            Label(
+                                model.isWaitingForSchedule ? "取消定时" : "停止任务",
+                                systemImage: "stop.fill"
+                            )
                         }
                     } else {
                         Button {
@@ -67,7 +122,12 @@ struct BatchSubmissionView: View {
                         } label: {
                             HStack {
                                 Spacer()
-                                Label("开始批量提交", systemImage: "paperplane.fill")
+                                Label(
+                                    model.startMode == .scheduled ? "设置定时提交" : "开始批量提交",
+                                    systemImage: model.startMode == .scheduled
+                                        ? "clock.badge.checkmark.fill"
+                                        : "paperplane.fill"
+                                )
                                 Spacer()
                             }
                         }
@@ -75,8 +135,36 @@ struct BatchSubmissionView: View {
                     }
                 }
 
+                if !model.logs.isEmpty {
+                    Section {
+                        ForEach(model.logs) { entry in
+                            BatchLogRow(entry: entry)
+                        }
+                    } header: {
+                        HStack {
+                            Text("运行日志")
+                            Spacer()
+                            Button {
+                                model.clearLogs()
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .accessibilityLabel("清空日志")
+                        }
+                    }
+                }
+
                 if !model.items.isEmpty {
                     Section("进度") {
+                        if let scheduledAt = model.scheduledAt {
+                            LabeledContent("计划提交") {
+                                Text(scheduledAt, format: .dateTime.month().day().hour().minute())
+                            }
+                            LabeledContent("倒计时") {
+                                Text(scheduledAt, style: .timer)
+                                    .monospacedDigit()
+                            }
+                        }
                         ProgressView(
                             value: Double(model.completedCount),
                             total: Double(model.items.count)
@@ -101,16 +189,68 @@ struct BatchSubmissionView: View {
                             .foregroundStyle(.red)
                     }
                 }
+
             }
             .navigationTitle("批量提交")
+            .onAppear {
+                model.reloadSurveyURL()
+            }
             .alert("确认批量提交", isPresented: $model.showsConfirmation) {
                 Button("取消", role: .cancel) {}
                 Button("确认提交") {
                     model.start()
                 }
             } message: {
-                Text("共 \(model.inputCount) 条，并发 \(model.concurrency)，等待 \(model.dwellSeconds) 秒。")
+                Text(
+                    "问卷字段：\(model.rosterMode.rawValue)（第 \(model.topicNumber) 题）\n"
+                    + confirmationTiming
+                    + "共 \(model.inputCount) 条，并发 \(model.concurrency)，等待 \(model.dwellSeconds) 秒。"
+                )
             }
+        }
+    }
+
+    private var confirmationTiming: String {
+        guard model.startMode == .scheduled else { return "" }
+        return "定时：\(model.scheduledDate.formatted(date: .abbreviated, time: .shortened))\n"
+    }
+}
+
+private struct BatchLogRow: View {
+    let entry: BatchLogEntry
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon)
+                .foregroundStyle(color)
+                .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.timestamp, format: .dateTime.hour().minute().second())
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(entry.message)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private var icon: String {
+        switch entry.level {
+        case .info: return "info.circle.fill"
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .error: return "xmark.octagon.fill"
+        }
+    }
+
+    private var color: Color {
+        switch entry.level {
+        case .info: return .blue
+        case .success: return .green
+        case .warning: return .orange
+        case .error: return .red
         }
     }
 }
@@ -121,10 +261,10 @@ private struct BatchItemRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.entry.name)
+                Text(item.entry.value)
                     .font(.body)
-                Text(item.entry.employeeID)
-                    .font(.caption.monospacedDigit())
+                Text("\(item.entry.mode.rawValue) · 第 \(item.entry.topic) 题")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                 if let detail {
                     Text(detail)

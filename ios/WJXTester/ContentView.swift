@@ -30,13 +30,18 @@ private struct SingleSubmissionView: View {
         NavigationStack {
             Form {
                 Section {
-                    LabeledContent("问卷") {
-                        Text(SurveyService.surveyID)
-                            .foregroundStyle(.secondary)
-                    }
+                    TextField("https://v.wjx.cn/vm/xxxx.aspx", text: $model.surveyURLString)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     LabeledContent("状态") {
-                        Label("测试环境", systemImage: "checkmark.shield.fill")
-                            .foregroundStyle(.green)
+                        if model.surveyURL != nil {
+                            Label("地址有效", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } else {
+                            Label("地址无效", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                        }
                     }
                 } header: {
                     Text("目标")
@@ -97,12 +102,15 @@ private struct SingleSubmissionView: View {
                             Spacer()
                         }
                     }
-                    .disabled(model.employeeID.count != 6 || model.name.isEmpty)
+                    .disabled(model.surveyURL == nil || model.employeeID.count != 6 || model.name.isEmpty)
                 }
 
                 statusSection
             }
             .navigationTitle("问卷测试")
+            .onAppear {
+                model.reloadSurveyURL()
+            }
             .alert("确认提交", isPresented: $model.showsConfirmation) {
                 Button("取消", role: .cancel) {}
                 Button("确认提交") {
@@ -112,7 +120,12 @@ private struct SingleSubmissionView: View {
                 Text("工号：\(model.employeeID)\n姓名：\(model.name)")
             }
             .sheet(isPresented: $model.showsBrowser) {
-                BrowserSheet(employeeID: model.employeeID, name: model.name)
+                if let surveyURL = model.surveyURL {
+                    BrowserSheet(
+                        url: surveyURL,
+                        answers: [1: model.employeeID, 2: model.name]
+                    )
+                }
             }
         }
     }

@@ -5,12 +5,12 @@ import Foundation
 struct BrowserSheet: View {
     @Environment(\.dismiss) private var dismiss
 
-    let employeeID: String
-    let name: String
+    let url: URL
+    let answers: [Int: String]
 
     var body: some View {
         NavigationStack {
-            SurveyWebView(url: SurveyService.pageURL, employeeID: employeeID, name: name)
+            SurveyWebView(url: url, answers: answers)
                 .ignoresSafeArea(edges: .bottom)
                 .navigationTitle("浏览器验证")
                 .navigationBarTitleDisplayMode(.inline)
@@ -27,11 +27,10 @@ struct BrowserSheet: View {
 
 struct SurveyWebView: UIViewRepresentable {
     let url: URL
-    let employeeID: String
-    let name: String
+    let answers: [Int: String]
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(employeeID: employeeID, name: name)
+        Coordinator(answers: answers)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -47,19 +46,17 @@ struct SurveyWebView: UIViewRepresentable {
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
     final class Coordinator: NSObject, WKNavigationDelegate {
-        private let employeeID: String
-        private let name: String
+        private let answers: [Int: String]
 
-        init(employeeID: String, name: String) {
-            self.employeeID = employeeID
-            self.name = name
+        init(answers: [Int: String]) {
+            self.answers = answers
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            let idJSON = Self.javascriptString(employeeID)
-            let nameJSON = Self.javascriptString(name)
+            let answersJSON = Self.javascriptObject(answers)
             let script = """
             (() => {
+              const answers = \(answersJSON);
               const setValue = (id, value) => {
                 const element = document.getElementById(id);
                 if (!element) return;
@@ -67,20 +64,19 @@ struct SurveyWebView: UIViewRepresentable {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
               };
-              setValue('q1', \(idJSON));
-              setValue('q2', \(nameJSON));
+              Object.entries(answers).forEach(([topic, value]) => setValue(`q${topic}`, value));
             })();
             """
             webView.evaluateJavaScript(script)
         }
 
-        private static func javascriptString(_ value: String) -> String {
-            guard let data = try? JSONSerialization.data(withJSONObject: [value]),
-                  let json = String(data: data, encoding: .utf8),
-                  json.count >= 2 else {
-                return "\"\""
+        private static func javascriptObject(_ answers: [Int: String]) -> String {
+            let object = Dictionary(uniqueKeysWithValues: answers.map { (String($0.key), $0.value) })
+            guard let data = try? JSONSerialization.data(withJSONObject: object),
+                  let json = String(data: data, encoding: .utf8) else {
+                return "{}"
             }
-            return String(json.dropFirst().dropLast())
+            return json
         }
     }
 }

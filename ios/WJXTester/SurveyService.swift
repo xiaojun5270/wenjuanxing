@@ -23,10 +23,23 @@ enum SurveyError: LocalizedError {
     }
 }
 
-actor SurveyService {
-    static let surveyID = "tghWxdt"
-    static let pageURL = URL(string: "https://v.wjx.cn/vm/\(surveyID).aspx")!
+enum SurveyTarget {
+    static let defaultURLString = "https://v.wjx.cn/vm/tghWxdt.aspx"
 
+    static func parse(_ rawValue: String) -> URL? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let value = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard let components = URLComponents(string: value),
+              components.scheme?.lowercased() == "https",
+              components.host != nil else {
+            return nil
+        }
+        return components.url
+    }
+}
+
+actor SurveyService {
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieAcceptPolicy = .always
@@ -39,15 +52,22 @@ actor SurveyService {
         return URLSession(configuration: configuration)
     }
 
-    func submit(employeeID: String, name: String, dwellSeconds: Int) async throws -> SubmissionOutcome {
+    func submit(
+        surveyURL: URL,
+        answers: [Int: String],
+        identityValue: String? = nil,
+        dwellSeconds: Int
+    ) async throws -> SubmissionOutcome {
+        guard !answers.isEmpty else { throw SurveyError.invalidResponse }
         let session = makeSession()
         let startedAt = Date()
-        let (pageData, pageResponse) = try await session.data(from: Self.pageURL)
+        let (pageData, pageResponse) = try await session.data(from: surveyURL)
         guard let httpResponse = pageResponse as? HTTPURLResponse,
               200..<300 ~= httpResponse.statusCode,
               let html = String(data: pageData, encoding: .utf8) else {
             throw SurveyError.invalidResponse
         }
+        let effectiveSurveyURL = httpResponse.url ?? surveyURL
 
         let startTime = try requiredMatch(
             in: html,
@@ -73,6 +93,11 @@ actor SurveyService {
             in: html,
             pattern: #"captchaSceneid\s*=\s*["']([^"']+)"#
         ) ?? "q0hcfsca"
+        let captchaType = capture(
+            in: html,
+            pattern: #"captchaType\s*=\s*["']?([^;"'\s]+)"#
+        ) ?? "2"
+        let submitBaseURL = try resolveSubmitURL(from: html, surveyURL: effectiveSurveyURL)
 
         let elapsed = Date().timeIntervalSince(startedAt)
         let remainingDelay = max(0, Double(dwellSeconds) - elapsed)
@@ -82,18 +107,21 @@ actor SurveyService {
 
         let interactionCount = Int.random(in: 3...6)
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        let answers = "1$\(sanitize(employeeID))}2$\(sanitize(name))"
+        let submitData = answers
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key)$\(sanitize($0.value))" }
+            .joined(separator: "}")
         let parameters: [(String, String)] = [
             ("starttime", startTime),
             ("cst", String(now)),
             ("submittype", "1"),
             ("ktimes", String(interactionCount)),
             ("rn", randomNumber),
-            ("jcn", dataEnc(name, key: interactionCount)),
+            ("jcn", dataEnc(identityValue ?? "", key: interactionCount)),
             ("nw", newAward),
             ("jwt", "4"),
             ("jpm", "70"),
-            ("capt", "2"),
+            ("capt", captchaType),
             ("t", String(now + Int64.random(in: 1...9))),
             ("wxfs", "100"),
             ("jqnonce", nonce),
@@ -103,23 +131,24 @@ actor SurveyService {
         let query = parameters
             .map { "\($0.0)=\(encodeURIComponent($0.1))" }
             .joined(separator: "&")
-        guard let submitURL = URL(
-            string: "https://v.wjx.cn/joinnew/processjq.ashx?shortid=\(Self.surveyID)&\(query)"
-        ) else {
+        let separator = submitBaseURL.absoluteString.contains("?") ? "&" : "?"
+        guard let submitURL = URL(string: submitBaseURL.absoluteString + separator + query) else {
             throw SurveyError.invalidURL
         }
 
         var request = URLRequest(url: submitURL)
         request.httpMethod = "POST"
-        request.setValue(Self.pageURL.absoluteString, forHTTPHeaderField: "Referer")
-        request.setValue("https://v.wjx.cn", forHTTPHeaderField: "Origin")
+        request.setValue(effectiveSurveyURL.absoluteString, forHTTPHeaderField: "Referer")
+        if let scheme = effectiveSurveyURL.scheme, let host = effectiveSurveyURL.host {
+            request.setValue("\(scheme)://\(host)", forHTTPHeaderField: "Origin")
+        }
         request.setValue("text/plain, */*; q=0.01", forHTTPHeaderField: "Accept")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
         request.setValue(
             "application/x-www-form-urlencoded; charset=UTF-8",
             forHTTPHeaderField: "Content-Type"
         )
-        let body = "submitdata=\(encodeURIComponent(answers))&sceneId=\(encodeURIComponent(sceneID))"
+        let body = "submitdata=\(encodeURIComponent(submitData))&sceneId=\(encodeURIComponent(sceneID))"
         request.httpBody = body.data(using: .utf8)
 
         let (responseData, response) = try await session.data(for: request)
@@ -136,13 +165,36 @@ actor SurveyService {
         let code = parts.first ?? ""
         let detail = parts.dropFirst().joined(separator: "〒")
         if code == "10" {
-            let resultURL = URL(string: detail, relativeTo: Self.pageURL)?.absoluteURL
+            let resultURL = URL(string: detail, relativeTo: effectiveSurveyURL)?.absoluteURL
             return .success(answerNumber: queryValue("sojumpindex", in: resultURL), resultURL: resultURL)
         }
         if code == "7" || code == "22" {
             return .verificationRequired(detail.isEmpty ? "需要在浏览器内完成安全验证。" : detail)
         }
         return .failure(detail.isEmpty ? text : detail)
+    }
+
+    private func resolveSubmitURL(from html: String, surveyURL: URL) throws -> URL {
+        let action = capture(
+            in: html,
+            pattern: #"<form[^>]*\baction=["']([^"']*processjq\.ashx[^"']*)"#
+        )?.replacingOccurrences(of: "&amp;", with: "&")
+        if let action,
+           let resolved = URL(string: action, relativeTo: surveyURL)?.absoluteURL {
+            return resolved
+        }
+
+        let filename = surveyURL.lastPathComponent
+        let shortID = filename.split(separator: ".").first.map(String.init) ?? ""
+        guard !shortID.isEmpty,
+              let host = surveyURL.host,
+              let scheme = surveyURL.scheme,
+              let fallback = URL(
+                string: "\(scheme)://\(host)/joinnew/processjq.ashx?shortid=\(encodeURIComponent(shortID))"
+              ) else {
+            throw SurveyError.invalidURL
+        }
+        return fallback
     }
 
     private func requiredCapture(in text: String, pattern: String, name: String) throws -> String {
