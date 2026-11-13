@@ -12,7 +12,7 @@ struct BatchSubmissionView: View {
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .disabled(model.isRunning)
+                        .disabled(model.isRunning || model.isDetectingFields)
                     LabeledContent("状态") {
                         if model.surveyURL != nil {
                             Label("地址有效", systemImage: "checkmark.circle.fill")
@@ -25,6 +25,37 @@ struct BatchSubmissionView: View {
                 }
 
                 Section("问卷字段") {
+                    Button {
+                        model.detectSurveyFields()
+                    } label: {
+                        HStack {
+                            if model.isDetectingFields {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("正在识别")
+                            } else {
+                                Label("自动识别姓名、工号、邮箱", systemImage: "viewfinder")
+                            }
+                            Spacer()
+                        }
+                    }
+                    .disabled(model.surveyURL == nil || model.isRunning || model.isDetectingFields)
+
+                    if let message = model.fieldDetectionMessage {
+                        Label(
+                            message,
+                            systemImage: model.fieldDetectionSucceeded
+                                ? "checkmark.circle.fill"
+                                : "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(
+                            model.fieldDetectionSucceeded
+                                ? Color.green
+                                : (message.hasPrefix("已识别") ? Color.orange : Color.red)
+                        )
+                    }
+
                     Stepper("姓名题号：\(model.nameTopic)", value: $model.nameTopic, in: 1...200)
                         .disabled(model.isRunning)
                     Stepper("工号题号：\(model.employeeIDTopic)", value: $model.employeeIDTopic, in: 1...200)
@@ -106,8 +137,6 @@ struct BatchSubmissionView: View {
                         .disabled(model.isRunning)
                     }
 
-                    Stepper("等待时间：\(model.dwellSeconds) 秒", value: $model.dwellSeconds, in: 1...15)
-                        .disabled(model.isRunning)
                     LabeledContent("提交引擎") {
                         Label("隐藏 WebKit", systemImage: "safari.fill")
                             .foregroundStyle(.blue)
@@ -214,7 +243,7 @@ struct BatchSubmissionView: View {
                 Text(
                     "字段题号：姓名 \(model.nameTopic)、工号 \(model.employeeIDTopic)、邮箱 \(model.emailTopic)\n"
                     + confirmationTiming
-                    + "共 \(model.inputCount) 份，全部同时启动，等待 \(model.dwellSeconds) 秒。"
+                    + "共 \(model.inputCount) 份，页面预加载完成后统一提交。"
                 )
             }
         }
@@ -281,8 +310,8 @@ private struct RosterEntryCard: View {
             }
 
             RosterField(
-                title: "邮箱",
-                placeholder: "邮箱",
+                title: "邮箱（可选）",
+                placeholder: "无邮箱时留空",
                 text: $entry.email,
                 keyboardType: .emailAddress
             )
@@ -385,7 +414,7 @@ private struct BatchItemRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.entry.name)
                     .font(.body)
-                Text("\(item.entry.employeeID) · \(item.entry.email)")
+                Text(itemSubtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let detail {
@@ -411,6 +440,12 @@ private struct BatchItemRow: View {
         case .queued, .running, .cancelled:
             return nil
         }
+    }
+
+    private var itemSubtitle: String {
+        item.entry.email.isEmpty
+            ? item.entry.employeeID
+            : "\(item.entry.employeeID) · \(item.entry.email)"
     }
 
     private var statusIcon: String {

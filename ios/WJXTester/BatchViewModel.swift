@@ -50,7 +50,9 @@ struct BatchEntry: Identifiable, Equatable, Sendable {
         var values: [Int: String] = [:]
         values[nameTopic] = name
         values[employeeIDTopic] = employeeID
-        values[emailTopic] = email
+        if !email.isEmpty {
+            values[emailTopic] = email
+        }
         return values
     }
 
@@ -118,7 +120,10 @@ private enum BatchInputError: LocalizedError {
 @MainActor
 final class BatchViewModel: ObservableObject {
     @Published var surveyURLString: String {
-        didSet { UserDefaults.standard.set(surveyURLString, forKey: "surveyURL") }
+        didSet {
+            UserDefaults.standard.set(surveyURLString, forKey: "surveyURL")
+            fieldDetectionMessage = nil
+        }
     }
     @Published var rosterEntries = [RosterDraft()] {
         didSet {
@@ -140,16 +145,20 @@ final class BatchViewModel: ObservableObject {
     }
     @Published var scheduledDate = Date().addingTimeInterval(5 * 60)
     @Published private(set) var scheduledAt: Date?
-    @Published var dwellSeconds = 6
     @Published var isAuthorized = false
     @Published var isRunning = false
     @Published var showsConfirmation = false
     @Published var items: [BatchItem] = []
     @Published private(set) var logs: [BatchLogEntry] = []
+    @Published private(set) var isDetectingFields = false
+    @Published private(set) var fieldDetectionMessage: String?
+    @Published private(set) var fieldDetectionSucceeded = false
     @Published var errorMessage: String?
 
     private let browserEngine = HeadlessBrowserEngine()
+    private let fieldDetector = SurveyFieldDetector()
     private var executionTask: Task<Void, Never>?
+    private var scheduleMarkerTask: Task<Void, Never>?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     init() {
@@ -166,6 +175,73 @@ final class BatchViewModel: ObservableObject {
               let saved = UserDefaults.standard.string(forKey: "surveyURL"),
               saved != surveyURLString else { return }
         surveyURLString = saved
+    }
+
+    func detectSurveyFields() {
+        guard !isRunning, !isDetectingFields else { return }
+        guard let surveyURL else {
+            fieldDetectionSucceeded = false
+            fieldDetectionMessage = "请输入有效的 HTTPS 问卷地址。"
+            return
+        }
+
+        isDetectingFields = true
+        fieldDetectionMessage = nil
+        Task {
+            do {
+                let fields = try await fieldDetector.detect(url: surveyURL)
+                var usedTopics = Set<Int>()
+                let nameField = matchingField(
+                    in: fields,
+                    keywords: ["姓名", "名字", "name"],
+                    excluding: usedTopics
+                )
+                if let nameField { usedTopics.insert(nameField.topic) }
+                let employeeIDField = matchingField(
+                    in: fields,
+                    keywords: ["工号", "员工号", "职工号", "学号", "employee id", "staff id"],
+                    excluding: usedTopics
+                )
+                if let employeeIDField { usedTopics.insert(employeeIDField.topic) }
+                let emailField = matchingField(
+                    in: fields,
+                    keywords: ["邮箱", "电子邮件", "邮件地址", "email", "e-mail"],
+                    excluding: usedTopics
+                )
+
+                if let nameField { nameTopic = nameField.topic }
+                if let employeeIDField { employeeIDTopic = employeeIDField.topic }
+                if let emailField { emailTopic = emailField.topic }
+
+                let missing = [
+                    nameField == nil ? "姓名" : nil,
+                    employeeIDField == nil ? "工号" : nil,
+                    emailField == nil ? "邮箱" : nil
+                ].compactMap { $0 }
+                let detected = [
+                    nameField.map { "姓名=第\($0.topic)题" },
+                    employeeIDField.map { "工号=第\($0.topic)题" },
+                    emailField.map { "邮箱=第\($0.topic)题" }
+                ].compactMap { $0 }.joined(separator: "、")
+
+                fieldDetectionSucceeded = missing.isEmpty
+                if missing.isEmpty {
+                    fieldDetectionMessage = "已识别：\(detected)"
+                    appendLog(.success, fieldDetectionMessage ?? "问卷字段识别完成")
+                } else {
+                    fieldDetectionMessage = "已识别 \(detected)；未找到：\(missing.joined(separator: "、"))"
+                    appendLog(.warning, fieldDetectionMessage ?? "部分问卷字段未识别")
+                }
+            } catch is CancellationError {
+                fieldDetectionSucceeded = false
+                fieldDetectionMessage = "字段识别已取消。"
+            } catch {
+                fieldDetectionSucceeded = false
+                fieldDetectionMessage = "字段识别失败：\(error.localizedDescription)"
+                appendLog(.error, fieldDetectionMessage ?? "字段识别失败")
+            }
+            isDetectingFields = false
+        }
     }
 
     var inputCount: Int {
@@ -228,9 +304,7 @@ final class BatchViewModel: ObservableObject {
 
         if name.isEmpty { issues.append("缺少姓名") }
         if employeeID.isEmpty { issues.append("缺少工号") }
-        if email.isEmpty {
-            issues.append("缺少邮箱")
-        } else if !isValidEmail(email) {
+        if !email.isEmpty && !isValidEmail(email) {
             issues.append("邮箱格式无效")
         }
         if name.count > 100 { issues.append("姓名过长") }
@@ -250,6 +324,18 @@ final class BatchViewModel: ObservableObject {
             issues.append("邮箱重复")
         }
         return issues
+    }
+
+    private func matchingField(
+        in fields: [DetectedSurveyField],
+        keywords: [String],
+        excluding usedTopics: Set<Int>
+    ) -> DetectedSurveyField? {
+        fields.first { field in
+            guard !usedTopics.contains(field.topic) else { return false }
+            let title = field.title.lowercased()
+            return keywords.contains(where: { title.contains($0.lowercased()) })
+        }
     }
 
     func clearLogs() {
@@ -298,15 +384,14 @@ final class BatchViewModel: ObservableObject {
         errorMessage = nil
         isRunning = true
 
-        let selectedDwell = dwellSeconds
         if startMode == .scheduled {
             let fireDate = scheduledDate
             scheduledAt = fireDate
             appendLog(
                 .info,
-                "已设置定时任务：\(entries.count) 份，计划 \(fireDate.formatted(date: .abbreviated, time: .shortened)) 开始"
+                "正在预加载 \(entries.count) 个隐藏浏览器，将在 \(fireDate.formatted(date: .abbreviated, time: .shortened)) 统一提交"
             )
-            executionTask = Task { [weak self] in
+            scheduleMarkerTask = Task { [weak self] in
                 guard let self else { return }
                 let delay = max(0, fireDate.timeIntervalSinceNow)
                 do {
@@ -316,12 +401,15 @@ final class BatchViewModel: ObservableObject {
                 }
                 guard !Task.isCancelled else { return }
                 scheduledAt = nil
-                appendLog(.info, "定时时间已到，开始提交")
+                appendLog(.info, "定时时间已到，统一放行已准备的隐藏浏览器")
                 beginBackgroundExecution()
+            }
+            executionTask = Task { [weak self] in
+                guard let self else { return }
                 await run(
                     entries: entries,
                     surveyURL: selectedSurveyURL,
-                    dwellSeconds: selectedDwell
+                    releaseDate: fireDate
                 )
             }
             return
@@ -335,13 +423,15 @@ final class BatchViewModel: ObservableObject {
             await run(
                 entries: entries,
                 surveyURL: selectedSurveyURL,
-                dwellSeconds: selectedDwell
+                releaseDate: nil
             )
         }
     }
 
     func cancel() {
         appendLog(.warning, isWaitingForSchedule ? "定时任务已取消" : "已请求停止运行任务")
+        scheduleMarkerTask?.cancel()
+        scheduleMarkerTask = nil
         executionTask?.cancel()
         browserEngine.cancelAll()
         if scheduledAt != nil {
@@ -357,9 +447,13 @@ final class BatchViewModel: ObservableObject {
     private func run(
         entries: [BatchEntry],
         surveyURL: URL,
-        dwellSeconds: Int
+        releaseDate: Date?
     ) async {
-        let submissionGate = BrowserSubmissionGate(participants: entries.count)
+        let submissionGate = BrowserSubmissionGate(
+            participants: entries.count,
+            releaseDate: releaseDate
+        )
+        await submissionGate.arm()
         await withTaskGroup(of: BatchCompletion.self) { group in
             for entry in entries {
                 mark(entry.id, as: .running)
@@ -367,7 +461,6 @@ final class BatchViewModel: ObservableObject {
                 add(
                     entry,
                     surveyURL: surveyURL,
-                    dwellSeconds: dwellSeconds,
                     gate: submissionGate,
                     to: &group
                 )
@@ -380,6 +473,7 @@ final class BatchViewModel: ObservableObject {
                 }
             }
         }
+        await submissionGate.cancel()
 
         if Task.isCancelled {
             let responseCount = items.filter {
@@ -402,6 +496,8 @@ final class BatchViewModel: ObservableObject {
         }
         isRunning = false
         scheduledAt = nil
+        scheduleMarkerTask?.cancel()
+        scheduleMarkerTask = nil
         executionTask = nil
         endBackgroundExecution()
     }
@@ -409,7 +505,6 @@ final class BatchViewModel: ObservableObject {
     private func add(
         _ entry: BatchEntry,
         surveyURL: URL,
-        dwellSeconds: Int,
         gate: BrowserSubmissionGate,
         to group: inout TaskGroup<BatchCompletion>
     ) {
@@ -422,7 +517,6 @@ final class BatchViewModel: ObservableObject {
                 id: entry.id,
                 surveyURL: surveyURL,
                 answers: entry.answers,
-                dwellSeconds: dwellSeconds,
                 gate: gate
             )
             if Task.isCancelled {

@@ -4,16 +4,32 @@ import WebKit
 actor BrowserSubmissionGate {
     private var expectedParticipants: Int
     private var arrivedParticipants = 0
+    private let releaseDate: Date?
+    private var releaseTimeReached: Bool
     private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var timerTask: Task<Void, Never>?
 
-    init(participants: Int) {
+    init(participants: Int, releaseDate: Date?) {
         expectedParticipants = max(0, participants)
+        self.releaseDate = releaseDate
+        releaseTimeReached = releaseDate.map { $0 <= Date() } ?? true
+    }
+
+    func arm() {
+        if let releaseDate, !releaseTimeReached, timerTask == nil {
+            let delay = max(0, releaseDate.timeIntervalSinceNow)
+            timerTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                await self?.markReleaseTimeReached()
+            }
+        }
     }
 
     func wait() async {
         arrivedParticipants += 1
-        if arrivedParticipants >= expectedParticipants {
-            releaseWaiters()
+        if canRelease {
+            releaseWaitersIfReady()
             return
         }
         await withCheckedContinuation { continuation in
@@ -23,12 +39,28 @@ actor BrowserSubmissionGate {
 
     func dropParticipant() {
         expectedParticipants = max(0, expectedParticipants - 1)
-        if arrivedParticipants >= expectedParticipants {
-            releaseWaiters()
-        }
+        releaseWaitersIfReady()
     }
 
-    private func releaseWaiters() {
+    func cancel() {
+        timerTask?.cancel()
+        timerTask = nil
+        releaseTimeReached = true
+        releaseWaitersIfReady(force: true)
+    }
+
+    private var canRelease: Bool {
+        releaseTimeReached && arrivedParticipants >= expectedParticipants
+    }
+
+    private func markReleaseTimeReached() {
+        releaseTimeReached = true
+        timerTask = nil
+        releaseWaitersIfReady()
+    }
+
+    private func releaseWaitersIfReady(force: Bool = false) {
+        guard force || canRelease else { return }
         let pending = waiters
         waiters.removeAll()
         pending.forEach { $0.resume() }
@@ -43,7 +75,6 @@ final class HeadlessBrowserEngine {
         id: UUID,
         surveyURL: URL,
         answers: [Int: String],
-        dwellSeconds: Int,
         gate: BrowserSubmissionGate
     ) async -> SubmissionOutcome {
         await withTaskCancellationHandler(operation: {
@@ -51,7 +82,6 @@ final class HeadlessBrowserEngine {
                 let worker = HeadlessBrowserWorker(
                     surveyURL: surveyURL,
                     answers: answers,
-                    dwellSeconds: dwellSeconds,
                     gate: gate
                 ) { [weak self] outcome in
                     self?.workers.removeValue(forKey: id)
@@ -80,7 +110,6 @@ final class HeadlessBrowserEngine {
 private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
     private let surveyURL: URL
     private let answers: [Int: String]
-    private let dwellSeconds: Int
     private let gate: BrowserSubmissionGate
     private var completion: ((SubmissionOutcome) -> Void)?
     private var webView: WKWebView!
@@ -95,13 +124,11 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
     init(
         surveyURL: URL,
         answers: [Int: String],
-        dwellSeconds: Int,
         gate: BrowserSubmissionGate,
         completion: @escaping (SubmissionOutcome) -> Void
     ) {
         self.surveyURL = surveyURL
         self.answers = answers
-        self.dwellSeconds = dwellSeconds
         self.gate = gate
         self.completion = completion
         super.init()
@@ -210,10 +237,6 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
             }
             self.submitTask = Task { [weak self] in
                 guard let self else { return }
-                try? await Task.sleep(
-                    nanoseconds: UInt64(max(1, self.dwellSeconds)) * 1_000_000_000
-                )
-                guard !Task.isCancelled, !self.isFinished else { return }
                 self.didJoinGate = true
                 await self.gate.wait()
                 guard !Task.isCancelled, !self.isFinished else { return }
