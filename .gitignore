@@ -1,0 +1,14 @@
+vendor/
+__pycache__/
+*.pyc
+debug_form.png
+error.png
+success.png
+timeout.png
+ios/build/
+ios/Payload/
+ios/*.ipa
+ios/*.xcodeproj/
+*.xcuserstate
+xcuserdata/
+.DS_Store

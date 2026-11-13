@@ -1,0 +1,58 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "ios/**"
+      - ".github/workflows/build-unsigned-ipa.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build app without signing
+        run: |
+          xcodebuild \
+            -project ios/WJXTester.xcodeproj \
+            -scheme WJXTester \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: Package IPA
+        run: |
+          APP_PATH="ios/build/Build/Products/Release-iphoneos/WJXTester.app"
+          test -d "$APP_PATH"
+          rm -rf ios/Payload
+          mkdir -p ios/Payload
+          cp -R "$APP_PATH" ios/Payload/
+          cd ios
+          ditto -c -k --sequesterRsrc --keepParent Payload WJXTester-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: WJXTester-unsigned-ipa
+          path: ios/WJXTester-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
