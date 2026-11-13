@@ -3,6 +3,7 @@ import UIKit
 
 struct BatchSubmissionView: View {
     @StateObject private var model = BatchViewModel()
+    @State private var showsRosterManager = false
 
     var body: some View {
         NavigationStack {
@@ -60,63 +61,51 @@ struct BatchSubmissionView: View {
                         .disabled(model.isRunning)
                     Stepper("工号题号：\(model.employeeIDTopic)", value: $model.employeeIDTopic, in: 1...200)
                         .disabled(model.isRunning)
-                    Stepper("邮箱题号：\(model.emailTopic)", value: $model.emailTopic, in: 1...200)
+                    Stepper("邮箱题号（可选）：\(model.emailTopic)", value: $model.emailTopic, in: 1...200)
                         .disabled(model.isRunning)
                     if !model.topicsAreValid {
-                        Label("三个问卷题号不能重复", systemImage: "exclamationmark.triangle.fill")
+                        Label(
+                            model.hasAnyEmail
+                                ? "姓名、工号、邮箱题号不能重复"
+                                : "姓名和工号题号不能重复",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
                             .foregroundStyle(.red)
                     }
                 }
 
                 Section {
-                    if model.rosterEntries.isEmpty {
-                        Label("暂无名单", systemImage: "person.crop.circle.badge.plus")
-                            .foregroundStyle(.secondary)
+                    LabeledContent("名单数量") {
+                        Text("\(model.inputCount) 份")
                     }
-
-                    ForEach($model.rosterEntries) { $entry in
-                        RosterEntryCard(
-                            number: model.ordinal(for: entry.id),
-                            entry: $entry,
-                            issues: model.validationIssues(for: entry),
-                            isDisabled: model.isRunning,
-                            onDelete: { model.removeRosterEntry(entry.id) }
-                        )
-                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
-                        .listRowBackground(Color.clear)
+                    LabeledContent("完整状态") {
+                        if model.rosterEntries.isEmpty {
+                            Text("暂无名单")
+                                .foregroundStyle(.secondary)
+                        } else if model.incompleteRosterCount == 0 {
+                            Label("全部完整", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } else {
+                            Label(
+                                "\(model.incompleteRosterCount) 份待完善",
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .foregroundStyle(.orange)
+                        }
                     }
-
                     Button {
-                        model.addRosterEntry()
+                        showsRosterManager = true
                     } label: {
                         HStack {
                             Spacer()
-                            Label("增加名单", systemImage: "plus.circle.fill")
+                            Label("管理名单", systemImage: "person.3.fill")
                             Spacer()
                         }
                     }
-                    .disabled(model.isRunning || model.rosterEntries.count >= 10)
-
-                    if !model.rosterEntries.isEmpty {
-                        Button(role: .destructive) {
-                            model.clearRoster()
-                        } label: {
-                            HStack {
-                                Spacer()
-                                Label("清空名单", systemImage: "trash")
-                                Spacer()
-                            }
-                        }
-                        .disabled(model.isRunning)
-                    }
                 } header: {
-                    HStack {
-                        Text("名单")
-                        Spacer()
-                        Text("\(model.inputCount) 份")
-                    }
+                    Text("名单")
                 } footer: {
-                    Text("每张完整名单对应一个独立隐藏浏览器，最多 10 份。")
+                    Text("名单已移至导航栏菜单，每份对应一个独立隐藏浏览器。")
                 }
 
                 Section("执行设置") {
@@ -231,8 +220,42 @@ struct BatchSubmissionView: View {
 
             }
             .navigationTitle("批量提交")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Menu {
+                        Button {
+                            showsRosterManager = true
+                        } label: {
+                            Label("名单管理", systemImage: "person.3.fill")
+                        }
+
+                        Button {
+                            model.addRosterEntry()
+                            showsRosterManager = true
+                        } label: {
+                            Label("新增名单", systemImage: "person.badge.plus")
+                        }
+                        .disabled(model.isRunning || model.rosterEntries.count >= 10)
+
+                        if !model.logs.isEmpty {
+                            Divider()
+                            Button(role: .destructive) {
+                                model.clearLogs()
+                            } label: {
+                                Label("清空运行日志", systemImage: "trash")
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "line.3.horizontal")
+                    }
+                    .accessibilityLabel("菜单")
+                }
+            }
             .onAppear {
                 model.reloadSurveyURL()
+            }
+            .sheet(isPresented: $showsRosterManager) {
+                RosterManagementView(model: model)
             }
             .alert("确认批量提交", isPresented: $model.showsConfirmation) {
                 Button("取消", role: .cancel) {}
@@ -241,7 +264,7 @@ struct BatchSubmissionView: View {
                 }
             } message: {
                 Text(
-                    "字段题号：姓名 \(model.nameTopic)、工号 \(model.employeeIDTopic)、邮箱 \(model.emailTopic)\n"
+                    confirmationTopics
                     + confirmationTiming
                     + "共 \(model.inputCount) 份，页面预加载完成后统一提交。"
                 )
@@ -251,7 +274,103 @@ struct BatchSubmissionView: View {
 
     private var confirmationTiming: String {
         guard model.startMode == .scheduled else { return "" }
-        return "定时：\(model.scheduledDate.formatted(date: .abbreviated, time: .shortened))\n"
+        return "定时：\(model.scheduledFireDate.formatted(date: .abbreviated, time: .standard))\n"
+    }
+
+    private var confirmationTopics: String {
+        if model.hasAnyEmail {
+            return "字段题号：姓名 \(model.nameTopic)、工号 \(model.employeeIDTopic)、邮箱 \(model.emailTopic)\n"
+        }
+        return "字段题号：姓名 \(model.nameTopic)、工号 \(model.employeeIDTopic)、邮箱跳过\n"
+    }
+}
+
+private struct RosterManagementView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: BatchViewModel
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    LabeledContent("名单数量") {
+                        Text("\(model.inputCount) / 10")
+                    }
+                    LabeledContent("资料完整") {
+                        Text("\(model.completeRosterCount) 份")
+                            .foregroundStyle(
+                                model.incompleteRosterCount == 0 ? Color.green : Color.primary
+                            )
+                    }
+                    if model.incompleteRosterCount > 0 {
+                        LabeledContent("待完善") {
+                            Text("\(model.incompleteRosterCount) 份")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                } header: {
+                    Text("概览")
+                }
+
+                Section {
+                    if model.rosterEntries.isEmpty {
+                        Label("暂无名单", systemImage: "person.crop.circle.badge.plus")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ForEach($model.rosterEntries) { $entry in
+                        RosterEntryCard(
+                            number: model.ordinal(for: entry.id),
+                            entry: $entry,
+                            issues: model.validationIssues(for: entry),
+                            isDisabled: model.isRunning,
+                            onDelete: { model.removeRosterEntry(entry.id) }
+                        )
+                        .listRowInsets(
+                            EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0)
+                        )
+                        .listRowBackground(Color.clear)
+                    }
+
+                    Button {
+                        model.addRosterEntry()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label("增加名单", systemImage: "plus.circle.fill")
+                            Spacer()
+                        }
+                    }
+                    .disabled(model.isRunning || model.rosterEntries.count >= 10)
+
+                    if !model.rosterEntries.isEmpty {
+                        Button(role: .destructive) {
+                            model.clearRoster()
+                        } label: {
+                            HStack {
+                                Spacer()
+                                Label("清空名单", systemImage: "trash")
+                                Spacer()
+                            }
+                        }
+                        .disabled(model.isRunning)
+                    }
+                } header: {
+                    Text("名单")
+                } footer: {
+                    Text("姓名和工号必填，邮箱可选；最多 10 份。")
+                }
+            }
+            .navigationTitle("名单管理")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
+            }
+        }
     }
 }
 

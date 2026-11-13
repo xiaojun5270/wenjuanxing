@@ -112,7 +112,7 @@ private enum BatchInputError: LocalizedError {
         case .invalidRecord(let index, let reason):
             return "名单 \(index) 格式错误：\(reason)"
         case .duplicateTopics:
-            return "姓名、工号、邮箱的问卷题号不能重复。"
+            return "已填写字段的问卷题号不能重复。"
         }
     }
 }
@@ -138,7 +138,7 @@ final class BatchViewModel: ObservableObject {
     @Published var emailTopic = 3
     @Published var startMode = BatchStartMode.immediate {
         didSet {
-            if startMode == .scheduled && scheduledDate <= Date().addingTimeInterval(1) {
+            if startMode == .scheduled && scheduledFireDate <= Date().addingTimeInterval(1) {
                 scheduledDate = Date().addingTimeInterval(5 * 60)
             }
         }
@@ -248,6 +248,14 @@ final class BatchViewModel: ObservableObject {
         rosterEntries.count
     }
 
+    var completeRosterCount: Int {
+        rosterEntries.filter { validationIssues(for: $0).isEmpty }.count
+    }
+
+    var incompleteRosterCount: Int {
+        inputCount - completeRosterCount
+    }
+
     var completedCount: Int {
         items.filter { $0.state.isFinished }.count
     }
@@ -268,13 +276,32 @@ final class BatchViewModel: ObservableObject {
     }
 
     var topicsAreValid: Bool {
-        let topics = [nameTopic, employeeIDTopic, emailTopic]
-        return topics.allSatisfy { (1...200).contains($0) }
-            && Set(topics).count == topics.count
+        let requiredTopics = [nameTopic, employeeIDTopic]
+        guard requiredTopics.allSatisfy({ (1...200).contains($0) }),
+              Set(requiredTopics).count == requiredTopics.count else {
+            return false
+        }
+        guard hasAnyEmail else { return true }
+        let allTopics = [nameTopic, employeeIDTopic, emailTopic]
+        return (1...200).contains(emailTopic) && Set(allTopics).count == allTopics.count
+    }
+
+    var hasAnyEmail: Bool {
+        rosterEntries.contains {
+            !$0.email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     var isWaitingForSchedule: Bool {
         isRunning && scheduledAt != nil
+    }
+
+    var scheduledFireDate: Date {
+        let components = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute],
+            from: scheduledDate
+        )
+        return Calendar.current.date(from: components) ?? scheduledDate
     }
 
     func addRosterEntry() {
@@ -344,7 +371,7 @@ final class BatchViewModel: ObservableObject {
 
     func requestStart() {
         guard canStart else { return }
-        if startMode == .scheduled && scheduledDate <= Date().addingTimeInterval(1) {
+        if startMode == .scheduled && scheduledFireDate <= Date().addingTimeInterval(1) {
             errorMessage = "定时时间必须晚于当前时间。"
             appendLog(.warning, errorMessage ?? "定时时间无效")
             return
@@ -361,7 +388,7 @@ final class BatchViewModel: ObservableObject {
 
     func start() {
         guard canStart else { return }
-        if startMode == .scheduled && scheduledDate <= Date() {
+        if startMode == .scheduled && scheduledFireDate <= Date() {
             errorMessage = "定时时间已过，请重新选择。"
             appendLog(.warning, errorMessage ?? "定时时间已过")
             return
@@ -385,11 +412,11 @@ final class BatchViewModel: ObservableObject {
         isRunning = true
 
         if startMode == .scheduled {
-            let fireDate = scheduledDate
+            let fireDate = scheduledFireDate
             scheduledAt = fireDate
             appendLog(
                 .info,
-                "正在预加载 \(entries.count) 个隐藏浏览器，将在 \(fireDate.formatted(date: .abbreviated, time: .shortened)) 统一提交"
+                "正在预加载 \(entries.count) 个隐藏浏览器，将在 \(fireDate.formatted(date: .abbreviated, time: .standard)) 统一提交"
             )
             scheduleMarkerTask = Task { [weak self] in
                 guard let self else { return }
@@ -461,6 +488,7 @@ final class BatchViewModel: ObservableObject {
                 add(
                     entry,
                     surveyURL: surveyURL,
+                    releaseDate: releaseDate,
                     gate: submissionGate,
                     to: &group
                 )
@@ -505,6 +533,7 @@ final class BatchViewModel: ObservableObject {
     private func add(
         _ entry: BatchEntry,
         surveyURL: URL,
+        releaseDate: Date?,
         gate: BrowserSubmissionGate,
         to group: inout TaskGroup<BatchCompletion>
     ) {
@@ -517,6 +546,8 @@ final class BatchViewModel: ObservableObject {
                 id: entry.id,
                 surveyURL: surveyURL,
                 answers: entry.answers,
+                optionalTopics: [entry.emailTopic],
+                releaseDate: releaseDate,
                 gate: gate
             )
             if Task.isCancelled {

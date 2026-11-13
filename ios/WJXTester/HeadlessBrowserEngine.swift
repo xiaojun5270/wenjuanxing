@@ -54,6 +54,11 @@ actor BrowserSubmissionGate {
     }
 
     private func markReleaseTimeReached() {
+        if let releaseDate, releaseDate > Date() {
+            timerTask = nil
+            arm()
+            return
+        }
         releaseTimeReached = true
         timerTask = nil
         releaseWaitersIfReady()
@@ -75,6 +80,8 @@ final class HeadlessBrowserEngine {
         id: UUID,
         surveyURL: URL,
         answers: [Int: String],
+        optionalTopics: Set<Int>,
+        releaseDate: Date?,
         gate: BrowserSubmissionGate
     ) async -> SubmissionOutcome {
         await withTaskCancellationHandler(operation: {
@@ -82,6 +89,8 @@ final class HeadlessBrowserEngine {
                 let worker = HeadlessBrowserWorker(
                     surveyURL: surveyURL,
                     answers: answers,
+                    optionalTopics: optionalTopics,
+                    releaseDate: releaseDate,
                     gate: gate
                 ) { [weak self] outcome in
                     self?.workers.removeValue(forKey: id)
@@ -110,6 +119,8 @@ final class HeadlessBrowserEngine {
 private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
     private let surveyURL: URL
     private let answers: [Int: String]
+    private let optionalTopics: Set<Int>
+    private let releaseDate: Date?
     private let gate: BrowserSubmissionGate
     private var completion: ((SubmissionOutcome) -> Void)?
     private var webView: WKWebView!
@@ -124,11 +135,15 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
     init(
         surveyURL: URL,
         answers: [Int: String],
+        optionalTopics: Set<Int>,
+        releaseDate: Date?,
         gate: BrowserSubmissionGate,
         completion: @escaping (SubmissionOutcome) -> Void
     ) {
         self.surveyURL = surveyURL
         self.answers = answers
+        self.optionalTopics = optionalTopics
+        self.releaseDate = releaseDate
         self.gate = gate
         self.completion = completion
         super.init()
@@ -136,6 +151,13 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: Self.submissionLockScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
         webView = WKWebView(
             frame: CGRect(x: -10_000, y: -10_000, width: 390, height: 844),
             configuration: configuration
@@ -145,8 +167,11 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
     }
 
     func start() {
+        let secondsUntilDeadline = max(90, (releaseDate?.timeIntervalSinceNow ?? 0) + 90)
         timeoutTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 90_000_000_000)
+            try? await Task.sleep(
+                nanoseconds: UInt64(secondsUntilDeadline * 1_000_000_000)
+            )
             guard !Task.isCancelled else { return }
             self?.finish(.failure("隐藏浏览器等待结果超时"))
         }
@@ -170,6 +195,20 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
             guard !Task.isCancelled, let self, !self.isFinished else { return }
             self.prepareAndScheduleSubmission()
         }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        let isSubmission = navigationAction.request.url?
+            .absoluteString.contains("processjq.ashx") == true
+        if isSubmission, let releaseDate, Date() < releaseDate {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
     }
 
     func webView(
@@ -204,14 +243,16 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
 
     private func prepareAndScheduleSubmission() {
         let answersJSON = javascriptObject(answers)
+        let optionalTopicsJSON = javascriptArray(optionalTopics)
         let fillScript = """
         (() => {
           const answers = \(answersJSON);
+          const optionalTopics = new Set(\(optionalTopicsJSON));
           const missing = [];
           Object.entries(answers).forEach(([topic, value]) => {
             const element = document.getElementById(`q${topic}`);
             if (!element) {
-              missing.push(topic);
+              if (!optionalTopics.has(Number(topic))) missing.push(topic);
               return;
             }
             element.focus();
@@ -240,15 +281,30 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
                 self.didJoinGate = true
                 await self.gate.wait()
                 guard !Task.isCancelled, !self.isFinished else { return }
+                await self.waitUntilReleaseDate()
+                guard !Task.isCancelled, !self.isFinished else { return }
                 self.clickSubmit()
             }
         }
     }
 
     private func clickSubmit() {
+        if let releaseDate, Date() < releaseDate {
+            submitTask = Task { [weak self] in
+                guard let self else { return }
+                await self.waitUntilReleaseDate()
+                guard !Task.isCancelled, !self.isFinished else { return }
+                self.clickSubmit()
+            }
+            return
+        }
         didSubmit = true
         let script = """
         (() => {
+          const queuedCount = typeof window.__wjxReleaseSubmission === 'function'
+            ? window.__wjxReleaseSubmission()
+            : 0;
+          if (queuedCount > 0) return 'released-queued';
           const button = document.querySelector('#ctlNext, button[type="submit"], input[type="submit"]');
           if (!button) return 'missing-submit';
           button.click();
@@ -281,6 +337,18 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
                 }
                 await self.probePageState()
             }
+        }
+    }
+
+    private func waitUntilReleaseDate() async {
+        guard let releaseDate else { return }
+        while !Task.isCancelled && !isFinished {
+            let remaining = releaseDate.timeIntervalSinceNow
+            if remaining <= 0 { return }
+            let sleepSeconds = min(remaining, 1)
+            try? await Task.sleep(
+                nanoseconds: UInt64(max(0.001, sleepSeconds) * 1_000_000_000)
+            )
         }
     }
 
@@ -331,6 +399,56 @@ private final class HeadlessBrowserWorker: NSObject, WKNavigationDelegate, WKUID
         }
         return json
     }
+
+    private func javascriptArray(_ topics: Set<Int>) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: Array(topics).sorted()),
+              let json = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return json
+    }
+
+    private static let submissionLockScript = """
+    (() => {
+      if (window.__wjxSubmissionLockInstalled) return;
+      window.__wjxSubmissionLockInstalled = true;
+      var released = false;
+      const queue = [];
+      const isSubmission = value => String(value || '').includes('processjq.ashx');
+
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__wjxRequestURL = url;
+        return originalOpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        if (!released && isSubmission(this.__wjxRequestURL)) {
+          queue.push(() => originalSend.call(this, body));
+          return;
+        }
+        return originalSend.call(this, body);
+      };
+
+      const originalFetch = window.fetch;
+      window.fetch = function(input, init) {
+        const url = typeof input === 'string' ? input : input?.url;
+        if (!released && isSubmission(url)) {
+          return new Promise((resolve, reject) => {
+            queue.push(() => originalFetch.call(window, input, init).then(resolve, reject));
+          });
+        }
+        return originalFetch.call(window, input, init);
+      };
+
+      window.__wjxReleaseSubmission = () => {
+        released = true;
+        const queuedCount = queue.length;
+        queue.splice(0).forEach(send => send());
+        return queuedCount;
+      };
+    })();
+    """
 
     private func finish(_ outcome: SubmissionOutcome) {
         guard !isFinished else { return }
