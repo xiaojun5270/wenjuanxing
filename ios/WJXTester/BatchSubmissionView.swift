@@ -130,6 +130,17 @@ struct BatchSubmissionView: View {
                         Label("隐藏 WebKit", systemImage: "safari.fill")
                             .foregroundStyle(.blue)
                     }
+                    LabeledContent("后台续跑") {
+                        Label(
+                            model.isBackgroundExecutionActive ? "已申请" : "任务启动时申请",
+                            systemImage: model.isBackgroundExecutionActive
+                                ? "checkmark.circle.fill"
+                                : "clock"
+                        )
+                        .foregroundStyle(
+                            model.isBackgroundExecutionActive ? Color.green : Color.secondary
+                        )
+                    }
                     Toggle("我已获授权测试此问卷", isOn: $model.isAuthorized)
                         .disabled(model.isRunning)
                 }
@@ -375,6 +386,8 @@ private struct RosterManagementView: View {
 }
 
 private struct RosterEntryCard: View {
+    @State private var showsDeleteConfirmation = false
+
     let number: Int
     @Binding var entry: RosterDraft
     let issues: [String]
@@ -405,10 +418,15 @@ private struct RosterEntryCard: View {
                     .foregroundStyle(issues.isEmpty ? Color.green : Color.secondary)
                     .frame(width: 28, height: 28)
 
-                Button(role: .destructive, action: onDelete) {
+                Button {
+                    showsDeleteConfirmation = true
+                } label: {
                     Image(systemName: "trash")
-                        .frame(width: 28, height: 28)
+                        .foregroundStyle(.red)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.borderless)
                 .accessibilityLabel("删除名单 \(number)")
                 .disabled(isDisabled)
             }
@@ -441,6 +459,14 @@ private struct RosterEntryCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(statusColor.opacity(0.35), lineWidth: 1)
+        }
+        .alert("删除名单 \(number)？", isPresented: $showsDeleteConfirmation) {
+            Button("取消", role: .cancel) {}
+            Button("删除", role: .destructive) {
+                onDelete()
+            }
+        } message: {
+            Text("删除后无法恢复。")
         }
         .disabled(isDisabled)
     }

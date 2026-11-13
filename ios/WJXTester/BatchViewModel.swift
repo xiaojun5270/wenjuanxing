@@ -2,7 +2,7 @@ import Foundation
 import Combine
 import UIKit
 
-struct RosterDraft: Identifiable, Equatable {
+struct RosterDraft: Identifiable, Equatable, Codable {
     let id: UUID
     var name: String
     var employeeID: String
@@ -119,6 +119,8 @@ private enum BatchInputError: LocalizedError {
 
 @MainActor
 final class BatchViewModel: ObservableObject {
+    private static let rosterStorageKey = "batchRosterEntries"
+
     @Published var surveyURLString: String {
         didSet {
             UserDefaults.standard.set(surveyURLString, forKey: "surveyURL")
@@ -127,6 +129,7 @@ final class BatchViewModel: ObservableObject {
     }
     @Published var rosterEntries = [RosterDraft()] {
         didSet {
+            persistRosterEntries()
             if !isRunning {
                 items = []
                 errorMessage = nil
@@ -147,6 +150,7 @@ final class BatchViewModel: ObservableObject {
     @Published private(set) var scheduledAt: Date?
     @Published var isAuthorized = false
     @Published var isRunning = false
+    @Published private(set) var isBackgroundExecutionActive = false
     @Published var showsConfirmation = false
     @Published var items: [BatchItem] = []
     @Published private(set) var logs: [BatchLogEntry] = []
@@ -164,6 +168,10 @@ final class BatchViewModel: ObservableObject {
     init() {
         surveyURLString = UserDefaults.standard.string(forKey: "surveyURL")
             ?? SurveyTarget.defaultURLString
+        if let data = UserDefaults.standard.data(forKey: Self.rosterStorageKey),
+           let savedEntries = try? JSONDecoder().decode([RosterDraft].self, from: data) {
+            rosterEntries = savedEntries
+        }
     }
 
     var surveyURL: URL? {
@@ -319,6 +327,11 @@ final class BatchViewModel: ObservableObject {
         rosterEntries = []
     }
 
+    private func persistRosterEntries() {
+        guard let data = try? JSONEncoder().encode(rosterEntries) else { return }
+        UserDefaults.standard.set(data, forKey: Self.rosterStorageKey)
+    }
+
     func ordinal(for id: UUID) -> Int {
         (rosterEntries.firstIndex(where: { $0.id == id }) ?? 0) + 1
     }
@@ -410,6 +423,7 @@ final class BatchViewModel: ObservableObject {
         items = entries.map { BatchItem(entry: $0, state: .queued) }
         errorMessage = nil
         isRunning = true
+        beginBackgroundExecution()
 
         if startMode == .scheduled {
             let fireDate = scheduledFireDate
@@ -429,7 +443,6 @@ final class BatchViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
                 scheduledAt = nil
                 appendLog(.info, "定时时间已到，统一放行已准备的隐藏浏览器")
-                beginBackgroundExecution()
             }
             executionTask = Task { [weak self] in
                 guard let self else { return }
@@ -444,7 +457,6 @@ final class BatchViewModel: ObservableObject {
 
         scheduledAt = nil
         appendLog(.info, "同时启动 \(entries.count) 个独立隐藏浏览器")
-        beginBackgroundExecution()
         executionTask = Task { [weak self] in
             guard let self else { return }
             await run(
@@ -469,6 +481,7 @@ final class BatchViewModel: ObservableObject {
             isRunning = false
             executionTask = nil
         }
+        endBackgroundExecution()
     }
 
     private func run(
@@ -642,13 +655,22 @@ final class BatchViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.appendLog(.warning, "系统后台执行时间已用尽，任务即将停止")
                 self?.cancel()
+                self?.endBackgroundExecution()
             }
+        }
+        isBackgroundExecutionActive = backgroundTask != .invalid
+        if isBackgroundExecutionActive {
+            appendLog(.info, "已申请 iOS 有限后台执行时间")
+        } else {
+            appendLog(.warning, "iOS 未授予后台执行时间，请保持应用在前台")
         }
     }
 
     private func endBackgroundExecution() {
-        guard backgroundTask != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTask)
-        backgroundTask = .invalid
+        if backgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+        isBackgroundExecutionActive = false
     }
 }
