@@ -2,34 +2,17 @@ import Foundation
 import Combine
 import UIKit
 
-enum RosterMode: String, CaseIterable, Identifiable, Sendable {
-    case name = "姓名"
-    case employeeID = "工号"
-    case email = "邮箱"
+struct RosterDraft: Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var employeeID: String
+    var email: String
 
-    var id: Self { self }
-
-    var defaultTopic: Int {
-        switch self {
-        case .name: return 2
-        case .employeeID: return 1
-        case .email: return 3
-        }
-    }
-
-    var placeholder: String {
-        switch self {
-        case .name: return "张三\n李四"
-        case .employeeID: return "100001\n100002"
-        case .email: return "test001@example.com\ntest002@example.com"
-        }
-    }
-
-    var keyboardType: UIKeyboardType {
-        switch self {
-        case .email: return .emailAddress
-        case .name, .employeeID: return .default
-        }
+    init(id: UUID = UUID(), name: String = "", employeeID: String = "", email: String = "") {
+        self.id = id
+        self.name = name
+        self.employeeID = employeeID
+        self.email = email
     }
 }
 
@@ -56,9 +39,24 @@ struct BatchLogEntry: Identifiable {
 
 struct BatchEntry: Identifiable, Equatable, Sendable {
     let id: UUID
-    let value: String
-    let mode: RosterMode
-    let topic: Int
+    let name: String
+    let employeeID: String
+    let email: String
+    let nameTopic: Int
+    let employeeIDTopic: Int
+    let emailTopic: Int
+
+    var answers: [Int: String] {
+        var values: [Int: String] = [:]
+        values[nameTopic] = name
+        values[employeeIDTopic] = employeeID
+        values[emailTopic] = email
+        return values
+    }
+
+    var logLabel: String {
+        "\(name)（\(employeeID)）"
+    }
 }
 
 enum BatchEntryState: Equatable, Sendable {
@@ -100,16 +98,19 @@ private struct BatchCompletion: Sendable {
 private enum BatchInputError: LocalizedError {
     case empty
     case tooMany(Int)
-    case invalidLine(Int, String)
+    case invalidRecord(Int, String)
+    case duplicateTopics
 
     var errorDescription: String? {
         switch self {
         case .empty:
-            return "请先输入名单。"
+            return "请先增加并填写名单。"
         case .tooMany(let count):
-            return "当前有 \(count) 条，单次最多处理 500 条。"
-        case .invalidLine(let line, let reason):
-            return "第 \(line) 行格式错误：\(reason)"
+            return "当前有 \(count) 份，隐藏浏览器模式单次最多处理 10 份。"
+        case .invalidRecord(let index, let reason):
+            return "名单 \(index) 格式错误：\(reason)"
+        case .duplicateTopics:
+            return "姓名、工号、邮箱的问卷题号不能重复。"
         }
     }
 }
@@ -119,15 +120,17 @@ final class BatchViewModel: ObservableObject {
     @Published var surveyURLString: String {
         didSet { UserDefaults.standard.set(surveyURLString, forKey: "surveyURL") }
     }
-    @Published var rawList = ""
-    @Published var rosterMode = RosterMode.name {
+    @Published var rosterEntries = [RosterDraft()] {
         didSet {
-            topicNumber = rosterMode.defaultTopic
-            items = []
-            errorMessage = nil
+            if !isRunning {
+                items = []
+                errorMessage = nil
+            }
         }
     }
-    @Published var topicNumber = RosterMode.name.defaultTopic
+    @Published var nameTopic = 2
+    @Published var employeeIDTopic = 1
+    @Published var emailTopic = 3
     @Published var startMode = BatchStartMode.immediate {
         didSet {
             if startMode == .scheduled && scheduledDate <= Date().addingTimeInterval(1) {
@@ -138,7 +141,6 @@ final class BatchViewModel: ObservableObject {
     @Published var scheduledDate = Date().addingTimeInterval(5 * 60)
     @Published private(set) var scheduledAt: Date?
     @Published var dwellSeconds = 6
-    @Published var concurrency = 3
     @Published var isAuthorized = false
     @Published var isRunning = false
     @Published var showsConfirmation = false
@@ -146,7 +148,7 @@ final class BatchViewModel: ObservableObject {
     @Published private(set) var logs: [BatchLogEntry] = []
     @Published var errorMessage: String?
 
-    private let service = SurveyService()
+    private let browserEngine = HeadlessBrowserEngine()
     private var executionTask: Task<Void, Never>?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -167,7 +169,7 @@ final class BatchViewModel: ObservableObject {
     }
 
     var inputCount: Int {
-        normalizedLines.count
+        rosterEntries.count
     }
 
     var completedCount: Int {
@@ -183,35 +185,71 @@ final class BatchViewModel: ObservableObject {
 
     var canStart: Bool {
         surveyURL != nil
-            && inputCount > 0 && inputCount <= 500
-            && (1...200).contains(topicNumber)
+            && inputCount > 0 && inputCount <= 10
+            && topicsAreValid
+            && rosterEntries.allSatisfy { validationIssues(for: $0).isEmpty }
             && isAuthorized && !isRunning
+    }
+
+    var topicsAreValid: Bool {
+        let topics = [nameTopic, employeeIDTopic, emailTopic]
+        return topics.allSatisfy { (1...200).contains($0) }
+            && Set(topics).count == topics.count
     }
 
     var isWaitingForSchedule: Bool {
         isRunning && scheduledAt != nil
     }
 
-    func loadExample() {
-        rawList = (1...10).map { index in
-            switch rosterMode {
-            case .name:
-                return "测试\(String(format: "%03d", index))"
-            case .employeeID:
-                return String(100_000 + index)
-            case .email:
-                return "test\(String(format: "%03d", index))@example.com"
-            }
-        }.joined(separator: "\n")
-        items = []
-        errorMessage = nil
+    func addRosterEntry() {
+        guard !isRunning, rosterEntries.count < 10 else { return }
+        rosterEntries.append(RosterDraft())
     }
 
-    func clear() {
+    func removeRosterEntry(_ id: UUID) {
         guard !isRunning else { return }
-        rawList = ""
-        items = []
-        errorMessage = nil
+        rosterEntries.removeAll(where: { $0.id == id })
+    }
+
+    func clearRoster() {
+        guard !isRunning else { return }
+        rosterEntries = []
+    }
+
+    func ordinal(for id: UUID) -> Int {
+        (rosterEntries.firstIndex(where: { $0.id == id }) ?? 0) + 1
+    }
+
+    func validationIssues(for entry: RosterDraft) -> [String] {
+        let name = entry.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let employeeID = entry.employeeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = entry.email.trimmingCharacters(in: .whitespacesAndNewlines)
+        var issues: [String] = []
+
+        if name.isEmpty { issues.append("缺少姓名") }
+        if employeeID.isEmpty { issues.append("缺少工号") }
+        if email.isEmpty {
+            issues.append("缺少邮箱")
+        } else if !isValidEmail(email) {
+            issues.append("邮箱格式无效")
+        }
+        if name.count > 100 { issues.append("姓名过长") }
+        if employeeID.count > 100 { issues.append("工号过长") }
+        if email.count > 254 { issues.append("邮箱过长") }
+        if !employeeID.isEmpty,
+           rosterEntries.filter({
+               $0.employeeID.trimmingCharacters(in: .whitespacesAndNewlines) == employeeID
+           }).count > 1 {
+            issues.append("工号重复")
+        }
+        if !email.isEmpty,
+           rosterEntries.filter({
+               $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                   == email.lowercased()
+           }).count > 1 {
+            issues.append("邮箱重复")
+        }
+        return issues
     }
 
     func clearLogs() {
@@ -260,14 +298,13 @@ final class BatchViewModel: ObservableObject {
         errorMessage = nil
         isRunning = true
 
-        let selectedConcurrency = concurrency
         let selectedDwell = dwellSeconds
         if startMode == .scheduled {
             let fireDate = scheduledDate
             scheduledAt = fireDate
             appendLog(
                 .info,
-                "已设置定时任务：\(entries.count) 条，计划 \(fireDate.formatted(date: .abbreviated, time: .shortened)) 开始"
+                "已设置定时任务：\(entries.count) 份，计划 \(fireDate.formatted(date: .abbreviated, time: .shortened)) 开始"
             )
             executionTask = Task { [weak self] in
                 guard let self else { return }
@@ -284,7 +321,6 @@ final class BatchViewModel: ObservableObject {
                 await run(
                     entries: entries,
                     surveyURL: selectedSurveyURL,
-                    concurrency: selectedConcurrency,
                     dwellSeconds: selectedDwell
                 )
             }
@@ -292,14 +328,13 @@ final class BatchViewModel: ObservableObject {
         }
 
         scheduledAt = nil
-        appendLog(.info, "开始批量提交：\(entries.count) 条，并发 \(selectedConcurrency)")
+        appendLog(.info, "同时启动 \(entries.count) 个独立隐藏浏览器")
         beginBackgroundExecution()
         executionTask = Task { [weak self] in
             guard let self else { return }
             await run(
                 entries: entries,
                 surveyURL: selectedSurveyURL,
-                concurrency: selectedConcurrency,
                 dwellSeconds: selectedDwell
             )
         }
@@ -308,6 +343,7 @@ final class BatchViewModel: ObservableObject {
     func cancel() {
         appendLog(.warning, isWaitingForSchedule ? "定时任务已取消" : "已请求停止运行任务")
         executionTask?.cancel()
+        browserEngine.cancelAll()
         if scheduledAt != nil {
             for index in items.indices where !items[index].state.isFinished {
                 items[index].state = .cancelled
@@ -321,35 +357,26 @@ final class BatchViewModel: ObservableObject {
     private func run(
         entries: [BatchEntry],
         surveyURL: URL,
-        concurrency: Int,
         dwellSeconds: Int
     ) async {
+        let submissionGate = BrowserSubmissionGate(participants: entries.count)
         await withTaskGroup(of: BatchCompletion.self) { group in
-            var nextIndex = 0
-            let initialCount = min(concurrency, entries.count)
-
-            for _ in 0..<initialCount {
-                let entry = entries[nextIndex]
-                nextIndex += 1
+            for entry in entries {
                 mark(entry.id, as: .running)
-                appendLog(.info, "\(entry.mode.rawValue) \(entry.value)：开始提交")
-                add(entry, surveyURL: surveyURL, dwellSeconds: dwellSeconds, to: &group)
+                appendLog(.info, "\(entry.logLabel)：隐藏浏览器已启动")
+                add(
+                    entry,
+                    surveyURL: surveyURL,
+                    dwellSeconds: dwellSeconds,
+                    gate: submissionGate,
+                    to: &group
+                )
             }
 
             while let completion = await group.next() {
                 apply(completion)
-
                 if Task.isCancelled {
                     group.cancelAll()
-                    continue
-                }
-
-                if nextIndex < entries.count {
-                    let entry = entries[nextIndex]
-                    nextIndex += 1
-                    mark(entry.id, as: .running)
-                    appendLog(.info, "\(entry.mode.rawValue) \(entry.value)：开始提交")
-                    add(entry, surveyURL: surveyURL, dwellSeconds: dwellSeconds, to: &group)
                 }
             }
         }
@@ -383,32 +410,31 @@ final class BatchViewModel: ObservableObject {
         _ entry: BatchEntry,
         surveyURL: URL,
         dwellSeconds: Int,
+        gate: BrowserSubmissionGate,
         to group: inout TaskGroup<BatchCompletion>
     ) {
-        let service = service
+        let browserEngine = browserEngine
         group.addTask {
             if Task.isCancelled {
                 return BatchCompletion(id: entry.id, result: .cancelled)
             }
-            do {
-                let outcome = try await service.submit(
-                    surveyURL: surveyURL,
-                    answers: [entry.topic: entry.value],
-                    identityValue: entry.mode == .name ? entry.value : nil,
-                    dwellSeconds: dwellSeconds
-                )
-                return BatchCompletion(id: entry.id, result: .outcome(outcome))
-            } catch is CancellationError {
+            let outcome = await browserEngine.submit(
+                id: entry.id,
+                surveyURL: surveyURL,
+                answers: entry.answers,
+                dwellSeconds: dwellSeconds,
+                gate: gate
+            )
+            if Task.isCancelled {
                 return BatchCompletion(id: entry.id, result: .cancelled)
-            } catch {
-                return BatchCompletion(id: entry.id, result: .failed(error.localizedDescription))
             }
+            return BatchCompletion(id: entry.id, result: .outcome(outcome))
         }
     }
 
     private func apply(_ completion: BatchCompletion) {
         let entry = items.first(where: { $0.id == completion.id })?.entry
-        let prefix = entry.map { "\($0.mode.rawValue) \($0.value)" } ?? "记录"
+        let prefix = entry?.logLabel ?? "记录"
         switch completion.result {
         case .outcome(.success(let answerNumber, _)):
             mark(completion.id, as: .success(answerNumber))
@@ -441,35 +467,33 @@ final class BatchViewModel: ObservableObject {
         items[index].state = state
     }
 
-    private var normalizedLines: [String] {
-        rawList
-            .split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-    }
-
     private func parseEntries() throws -> [BatchEntry] {
-        let lines = normalizedLines
-        guard !lines.isEmpty else { throw BatchInputError.empty }
-        guard lines.count <= 500 else { throw BatchInputError.tooMany(lines.count) }
+        guard !rosterEntries.isEmpty else { throw BatchInputError.empty }
+        guard rosterEntries.count <= 10 else {
+            throw BatchInputError.tooMany(rosterEntries.count)
+        }
+        guard topicsAreValid else { throw BatchInputError.duplicateTopics }
 
-        var usedValues = Set<String>()
         var entries: [BatchEntry] = []
 
-        for (offset, line) in lines.enumerated() {
-            let lineNumber = offset + 1
-            guard line.count <= 254 else {
-                throw BatchInputError.invalidLine(lineNumber, "内容过长")
-            }
-            if rosterMode == .email && !isValidEmail(line) {
-                throw BatchInputError.invalidLine(lineNumber, "邮箱格式无效")
-            }
-            let duplicateKey = rosterMode == .email ? line.lowercased() : line
-            guard usedValues.insert(duplicateKey).inserted else {
-                throw BatchInputError.invalidLine(lineNumber, "\(rosterMode.rawValue)重复")
+        for (offset, draft) in rosterEntries.enumerated() {
+            let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let employeeID = draft.employeeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let email = draft.email.trimmingCharacters(in: .whitespacesAndNewlines)
+            let issues = validationIssues(for: draft)
+            guard issues.isEmpty else {
+                throw BatchInputError.invalidRecord(offset + 1, issues.joined(separator: "、"))
             }
             entries.append(
-                BatchEntry(id: UUID(), value: line, mode: rosterMode, topic: topicNumber)
+                BatchEntry(
+                    id: draft.id,
+                    name: name,
+                    employeeID: employeeID,
+                    email: email,
+                    nameTopic: nameTopic,
+                    employeeIDTopic: employeeIDTopic,
+                    emailTopic: emailTopic
+                )
             )
         }
         return entries

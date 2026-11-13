@@ -1,8 +1,8 @@
 import SwiftUI
+import UIKit
 
 struct BatchSubmissionView: View {
     @StateObject private var model = BatchViewModel()
-    @FocusState private var isEditorFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -24,59 +24,68 @@ struct BatchSubmissionView: View {
                     }
                 }
 
+                Section("问卷字段") {
+                    Stepper("姓名题号：\(model.nameTopic)", value: $model.nameTopic, in: 1...200)
+                        .disabled(model.isRunning)
+                    Stepper("工号题号：\(model.employeeIDTopic)", value: $model.employeeIDTopic, in: 1...200)
+                        .disabled(model.isRunning)
+                    Stepper("邮箱题号：\(model.emailTopic)", value: $model.emailTopic, in: 1...200)
+                        .disabled(model.isRunning)
+                    if !model.topicsAreValid {
+                        Label("三个问卷题号不能重复", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                    }
+                }
+
                 Section {
-                    Picker("名单模式", selection: $model.rosterMode) {
-                        ForEach(RosterMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(model.isRunning)
-
-                    Stepper(
-                        "\(model.rosterMode.rawValue)题号：\(model.topicNumber)",
-                        value: $model.topicNumber,
-                        in: 1...200
-                    )
-                    .disabled(model.isRunning)
-
-                    ZStack(alignment: .topLeading) {
-                        if model.rawList.isEmpty {
-                            Text(model.rosterMode.placeholder)
-                                .foregroundStyle(.tertiary)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 8)
-                        }
-                        TextEditor(text: $model.rawList)
-                            .frame(minHeight: 150)
-                            .keyboardType(model.rosterMode.keyboardType)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .focused($isEditorFocused)
-                            .disabled(model.isRunning)
-                    }
-
-                    HStack {
-                        Label("\(model.inputCount) 条", systemImage: "list.number")
+                    if model.rosterEntries.isEmpty {
+                        Label("暂无名单", systemImage: "person.crop.circle.badge.plus")
                             .foregroundStyle(.secondary)
-                        Spacer()
-                        Button {
-                            model.loadExample()
+                    }
+
+                    ForEach($model.rosterEntries) { $entry in
+                        RosterEntryCard(
+                            number: model.ordinal(for: entry.id),
+                            entry: $entry,
+                            issues: model.validationIssues(for: entry),
+                            isDisabled: model.isRunning,
+                            onDelete: { model.removeRosterEntry(entry.id) }
+                        )
+                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                        .listRowBackground(Color.clear)
+                    }
+
+                    Button {
+                        model.addRosterEntry()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label("增加名单", systemImage: "plus.circle.fill")
+                            Spacer()
+                        }
+                    }
+                    .disabled(model.isRunning || model.rosterEntries.count >= 10)
+
+                    if !model.rosterEntries.isEmpty {
+                        Button(role: .destructive) {
+                            model.clearRoster()
                         } label: {
-                            Label("示例", systemImage: "doc.badge.plus")
+                            HStack {
+                                Spacer()
+                                Label("清空名单", systemImage: "trash")
+                                Spacer()
+                            }
                         }
                         .disabled(model.isRunning)
-                        Button(role: .destructive) {
-                            model.clear()
-                        } label: {
-                            Label("清空", systemImage: "trash")
-                        }
-                        .disabled(model.isRunning || model.rawList.isEmpty)
                     }
                 } header: {
-                    Text("名单")
+                    HStack {
+                        Text("名单")
+                        Spacer()
+                        Text("\(model.inputCount) 份")
+                    }
                 } footer: {
-                    Text("每行填写一个\(model.rosterMode.rawValue)，最多 500 条。")
+                    Text("每张完整名单对应一个独立隐藏浏览器，最多 10 份。")
                 }
 
                 Section("执行设置") {
@@ -99,8 +108,10 @@ struct BatchSubmissionView: View {
 
                     Stepper("等待时间：\(model.dwellSeconds) 秒", value: $model.dwellSeconds, in: 1...15)
                         .disabled(model.isRunning)
-                    Stepper("并发数量：\(model.concurrency)", value: $model.concurrency, in: 1...10)
-                        .disabled(model.isRunning)
+                    LabeledContent("提交引擎") {
+                        Label("隐藏 WebKit", systemImage: "safari.fill")
+                            .foregroundStyle(.blue)
+                    }
                     Toggle("我已获授权测试此问卷", isOn: $model.isAuthorized)
                         .disabled(model.isRunning)
                 }
@@ -117,7 +128,6 @@ struct BatchSubmissionView: View {
                         }
                     } else {
                         Button {
-                            isEditorFocused = false
                             model.requestStart()
                         } label: {
                             HStack {
@@ -202,9 +212,9 @@ struct BatchSubmissionView: View {
                 }
             } message: {
                 Text(
-                    "问卷字段：\(model.rosterMode.rawValue)（第 \(model.topicNumber) 题）\n"
+                    "字段题号：姓名 \(model.nameTopic)、工号 \(model.employeeIDTopic)、邮箱 \(model.emailTopic)\n"
                     + confirmationTiming
-                    + "共 \(model.inputCount) 条，并发 \(model.concurrency)，等待 \(model.dwellSeconds) 秒。"
+                    + "共 \(model.inputCount) 份，全部同时启动，等待 \(model.dwellSeconds) 秒。"
                 )
             }
         }
@@ -213,6 +223,118 @@ struct BatchSubmissionView: View {
     private var confirmationTiming: String {
         guard model.startMode == .scheduled else { return "" }
         return "定时：\(model.scheduledDate.formatted(date: .abbreviated, time: .shortened))\n"
+    }
+}
+
+private struct RosterEntryCard: View {
+    let number: Int
+    @Binding var entry: RosterDraft
+    let issues: [String]
+    let isDisabled: Bool
+    let onDelete: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text("\(number)")
+                    .font(.caption.bold())
+                    .foregroundStyle(.orange)
+                    .frame(width: 34, height: 34)
+                    .background(Color.orange.opacity(0.12), in: Circle())
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("名单 \(number)")
+                        .font(.subheadline.bold())
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(statusColor)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 6)
+
+                Image(systemName: issues.isEmpty ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(issues.isEmpty ? Color.green : Color.secondary)
+                    .frame(width: 28, height: 28)
+
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                        .frame(width: 28, height: 28)
+                }
+                .accessibilityLabel("删除名单 \(number)")
+                .disabled(isDisabled)
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                RosterField(
+                    title: "姓名",
+                    placeholder: "姓名",
+                    text: $entry.name,
+                    keyboardType: .default
+                )
+                RosterField(
+                    title: "工号",
+                    placeholder: "工号",
+                    text: $entry.employeeID,
+                    keyboardType: .default
+                )
+            }
+
+            RosterField(
+                title: "邮箱",
+                placeholder: "邮箱",
+                text: $entry.email,
+                keyboardType: .emailAddress
+            )
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(statusColor.opacity(0.35), lineWidth: 1)
+        }
+        .disabled(isDisabled)
+    }
+
+    private var statusText: String {
+        issues.isEmpty ? "资料完整" : issues.joined(separator: "、")
+    }
+
+    private var statusColor: Color {
+        if issues.isEmpty { return .green }
+        if issues.contains(where: { $0.contains("无效") || $0.contains("重复") }) {
+            return .red
+        }
+        return .orange
+    }
+}
+
+private struct RosterField: View {
+    let title: String
+    let placeholder: String
+    @Binding var text: String
+    let keyboardType: UIKeyboardType
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField(placeholder, text: $text)
+                .keyboardType(keyboardType)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .padding(.horizontal, 10)
+                .frame(height: 40)
+                .background(Color(uiColor: .systemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -261,9 +383,9 @@ private struct BatchItemRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.entry.value)
+                Text(item.entry.name)
                     .font(.body)
-                Text("\(item.entry.mode.rawValue) · 第 \(item.entry.topic) 题")
+                Text("\(item.entry.employeeID) · \(item.entry.email)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let detail {
